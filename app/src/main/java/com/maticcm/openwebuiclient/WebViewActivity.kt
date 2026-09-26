@@ -96,6 +96,7 @@ class WebViewActivity : AppCompatActivity() {
     private val MICROPHONE_PERMISSION_REQUEST = 101
     private var pendingCameraCapture = false
     private var pendingMicrophoneAccess = false
+    private var pendingPermissionRequest: PermissionRequest? = null
 
     private val requestPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -108,8 +109,8 @@ class WebViewActivity : AppCompatActivity() {
             }
             if (pendingMicrophoneAccess) {
                 pendingMicrophoneAccess = false
-                // Inject JavaScript to notify the web page that permission was granted
-                injectMicrophonePermissionGranted()
+                pendingPermissionRequest?.grant(arrayOf(PermissionRequest.RESOURCE_AUDIO_CAPTURE))
+                pendingPermissionRequest = null
             }
         } else {
             Log.e("WebViewActivity", "Permission denied")
@@ -118,7 +119,9 @@ class WebViewActivity : AppCompatActivity() {
                 filePathCallback = null
             }
             if (pendingMicrophoneAccess) {
-                injectMicrophonePermissionDenied()
+                pendingMicrophoneAccess = false
+                pendingPermissionRequest?.deny()
+                pendingPermissionRequest = null
             }
         }
     }
@@ -173,9 +176,6 @@ class WebViewActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        
-        // Initialize WebView settings globally for better performance
-        WebView.enableSlowWholeDocumentDraw()
         
         binding = ActivityWebviewBinding.inflate(layoutInflater)
         setContentView(binding.root)
@@ -243,23 +243,7 @@ class WebViewActivity : AppCompatActivity() {
             binding.webView.settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
         }
 
-        // Add JavaScript interface for microphone permission
         binding.webView.addJavascriptInterface(object {
-            @JavascriptInterface
-            fun requestMicrophonePermission() {
-                runOnUiThread {
-                    Log.d("WebViewActivity", "Microphone permission requested from JavaScript")
-                    if (checkMicrophonePermission()) {
-                        Log.d("WebViewActivity", "Microphone permission already granted")
-                        injectMicrophonePermissionGranted()
-                    } else {
-                        Log.d("WebViewActivity", "Requesting microphone permission")
-                        pendingMicrophoneAccess = true
-                        requestMicrophonePermission()
-                    }
-                }
-            }
-
             @JavascriptInterface
             fun log(message: String) {
                 Log.d("WebViewActivity", "JavaScript: $message")
@@ -296,12 +280,11 @@ class WebViewActivity : AppCompatActivity() {
                 if (request.resources.contains(PermissionRequest.RESOURCE_AUDIO_CAPTURE)) {
                     if (checkMicrophonePermission()) {
                         Log.d("WebViewActivity", "Granting microphone permission")
-                        // Inject JavaScript to notify the web page that permission was granted
-                        injectMicrophonePermissionGranted()
                         request.grant(arrayOf(PermissionRequest.RESOURCE_AUDIO_CAPTURE))
                     } else {
                         Log.d("WebViewActivity", "Requesting microphone permission")
                         pendingMicrophoneAccess = true
+                        pendingPermissionRequest = request
                         requestMicrophonePermission()
                     }
                 } else {
@@ -373,39 +356,6 @@ class WebViewActivity : AppCompatActivity() {
                 Log.d("WebViewActivity", "WebView loaded: $url")
                 injectImageHandlingScript()
                 injectLinkHandlingScript()
-                
-                // Inject JavaScript to handle microphone access
-                val microphoneScript = """
-                    window.Android.log('Page loaded, setting up microphone access');
-                    
-                    // Create a global function to handle microphone access
-                    window.handleMicrophoneAccess = function() {
-                        window.Android.log('handleMicrophoneAccess called');
-                        return new Promise(function(resolve, reject) {
-                            window.Android.log('Requesting microphone permission');
-                            window.Android.requestMicrophonePermission();
-                            resolve();
-                        });
-                    };
-                    
-                    // Override getUserMedia if available
-                    if (window.navigator.mediaDevices) {
-                        window.Android.log('Media devices available');
-                        const originalGetUserMedia = window.navigator.mediaDevices.getUserMedia;
-                        window.navigator.mediaDevices.getUserMedia = function(constraints) {
-                            window.Android.log('getUserMedia called with constraints: ' + JSON.stringify(constraints));
-                            return window.handleMicrophoneAccess();
-                        };
-                    } else {
-                        window.Android.log('Media devices not available');
-                    }
-                    
-                    // Add error handling
-                    window.addEventListener('error', function(e) {
-                        window.Android.log('JavaScript error: ' + e.message);
-                    });
-                """.trimIndent()
-                binding.webView.evaluateJavascript(microphoneScript, null)
             }
 
             override fun shouldOverrideUrlLoading(view: WebView?, url: String?): Boolean {
@@ -696,7 +646,27 @@ class WebViewActivity : AppCompatActivity() {
 
     private fun showConnectionError() {
         Log.e("WebViewActivity", "Connection failed or timed out")
-        binding.webView.loadUrl("about:blank")
+        binding.progressBar.isVisible = false
+        val displayUrl = android.text.Html.escapeHtml(baseUrl)
+        val html = """
+            <html>
+            <head>
+                <meta name="viewport" content="width=device-width, initial-scale=1">
+                <style>
+                    body { font-family: sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; margin: 0; background: #111827; color: #e5e7eb; text-align: center; padding: 24px; box-sizing: border-box; }
+                    h2 { margin: 0 0 8px; }
+                    .url { color: #9ca3af; word-break: break-all; margin-bottom: 24px; }
+                    .retry { padding: 12px 32px; background: #3b82f6; color: white; border-radius: 8px; text-decoration: none; font-size: 16px; }
+                </style>
+            </head>
+            <body>
+                <h2>Connection failed</h2>
+                <p class="url">$displayUrl</p>
+                <a class="retry" href="$baseUrl">Retry</a>
+            </body>
+            </html>
+        """.trimIndent()
+        binding.webView.loadDataWithBaseURL(baseUrl, html, "text/html", "UTF-8", null)
     }
 
     private fun handleIntent(intent: Intent) {
@@ -1039,14 +1009,12 @@ class WebViewActivity : AppCompatActivity() {
                 if (activePointers.size < REQUIRED_FINGERS) {
                     isLongPressing = false
                     hideLongPressIndicator()
-                    timeoutHandler.removeCallbacksAndMessages(null)
                 }
             }
             MotionEvent.ACTION_CANCEL -> {
                 activePointers.clear()
                 isLongPressing = false
                 hideLongPressIndicator()
-                timeoutHandler.removeCallbacksAndMessages(null)
             }
         }
         return false
@@ -1154,54 +1122,17 @@ class WebViewActivity : AppCompatActivity() {
                 imageFile
             )
             Log.d("WebViewActivity", "Created camera URI: $cameraImageUri")
-
-            // Grant URI permissions
-            val takePictureIntent = Intent(MediaStore.ACTION_IMAGE_CAPTURE).apply {
-                putExtra(MediaStore.EXTRA_OUTPUT, cameraImageUri)
-                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
-            }
-
-            // Check if there's a camera app available
-            if (takePictureIntent.resolveActivity(packageManager) != null) {
-                cameraLauncher.launch(cameraImageUri)
-                Log.d("WebViewActivity", "Launched camera")
-            } else {
-                Log.e("WebViewActivity", "No camera app available")
-                filePathCallback?.onReceiveValue(null)
-                filePathCallback = null
-            }
+            cameraLauncher.launch(cameraImageUri)
+            Log.d("WebViewActivity", "Launched camera")
+        } catch (e: android.content.ActivityNotFoundException) {
+            Log.e("WebViewActivity", "No camera app available", e)
+            filePathCallback?.onReceiveValue(null)
+            filePathCallback = null
         } catch (e: Exception) {
             Log.e("WebViewActivity", "Error launching camera", e)
             filePathCallback?.onReceiveValue(null)
             filePathCallback = null
         }
-    }
-
-    private fun injectMicrophonePermissionGranted() {
-        val javascript = """
-            window.Android.log('Microphone permission granted');
-            if (window.handleMicrophoneAccess) {
-                window.handleMicrophoneAccess().then(function() {
-                    window.Android.log('Microphone access resolved');
-                }).catch(function(error) {
-                    window.Android.log('Microphone access error: ' + error);
-                });
-            }
-        """.trimIndent()
-        binding.webView.evaluateJavascript(javascript, null)
-    }
-
-    private fun injectMicrophonePermissionDenied() {
-        val javascript = """
-            window.Android.log('Microphone permission denied');
-            if (window.handleMicrophoneAccess) {
-                window.handleMicrophoneAccess().catch(function(error) {
-                    window.Android.log('Microphone access error: ' + error);
-                });
-            }
-        """.trimIndent()
-        binding.webView.evaluateJavascript(javascript, null)
     }
 
     private fun checkMicrophonePermission(): Boolean {
