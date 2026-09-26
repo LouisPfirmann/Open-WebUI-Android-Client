@@ -13,3 +13,6 @@
 .externalNativeBuild
 .cxx
 local.properties
+
+# Build outputs committed upstream by mistake
+app/release/
