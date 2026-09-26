@@ -47,7 +47,7 @@ import java.util.Date
 import java.util.Locale
 import androidx.core.content.FileProvider
 import java.util.regex.Pattern
-import android.webkit.JavascriptInterface
+import android.webkit.CookieManager
 import android.webkit.PermissionRequest
 
 class WebViewActivity : AppCompatActivity() {
@@ -96,6 +96,9 @@ class WebViewActivity : AppCompatActivity() {
     private var pendingCameraCapture = false
     private var pendingMicrophoneAccess = false
     private var pendingPermissionRequest: PermissionRequest? = null
+
+    /** Decides which navigations stay in the WebView. See [NavigationPolicy]. */
+    private lateinit var navigationPolicy: NavigationPolicy
 
     private val requestPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -187,6 +190,7 @@ class WebViewActivity : AppCompatActivity() {
         // Get the saved URL
         baseUrl = getSharedPreferences("AppPrefs", MODE_PRIVATE)
             .getString("SAVED_URL", null) ?: return
+        navigationPolicy = NavigationPolicy(baseUrl)
 
         setupWebView()
         handleIntent(intent)
@@ -209,7 +213,7 @@ class WebViewActivity : AppCompatActivity() {
             javaScriptEnabled = true
             domStorageEnabled = true
             databaseEnabled = true
-            setSupportMultipleWindows(true)
+            setSupportMultipleWindows(false)
             allowContentAccess = true
             allowFileAccess = true
             loadWithOverviewMode = true
@@ -242,25 +246,10 @@ class WebViewActivity : AppCompatActivity() {
             binding.webView.settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
         }
 
-        binding.webView.addJavascriptInterface(object {
-            @JavascriptInterface
-            fun log(message: String) {
-                Log.d("WebViewActivity", "JavaScript: $message")
-            }
-
-            @JavascriptInterface
-            fun openLink(url: String) {
-                runOnUiThread {
-                    Log.d("WebViewActivity", "Opening link: $url")
-                    try {
-                        val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
-                        startActivity(intent)
-                    } catch (e: Exception) {
-                        Log.e("WebViewActivity", "Error opening link: $url", e)
-                    }
-                }
-            }
-        }, "Android")
+        CookieManager.getInstance().let { cookies ->
+            cookies.setAcceptCookie(true)
+            cookies.setAcceptThirdPartyCookies(binding.webView, true)
+        }
 
         binding.webView.setLayerType(WebView.LAYER_TYPE_HARDWARE, null)
 
@@ -334,40 +323,7 @@ class WebViewActivity : AppCompatActivity() {
             }
         }
 
-        // Set up WebViewClient
-        binding.webView.webViewClient = object : WebViewClient() {
-            override fun onReceivedError(
-                view: WebView?,
-                request: WebResourceRequest?,
-                error: WebResourceError?
-            ) {
-                super.onReceivedError(view, request, error)
-                timeoutHandler.removeCallbacks(timeoutRunnable)
-                Log.e("WebViewActivity", "WebView error: ${error?.description}")
-                showConnectionError()
-            }
-
-            override fun onPageFinished(view: WebView?, url: String?) {
-                timeoutHandler.removeCallbacks(timeoutRunnable)
-                binding.progressBar.isVisible = false
-                binding.webView.alpha = 1f
-                isWebViewReady = true
-                Log.d("WebViewActivity", "WebView loaded: $url")
-                injectImageHandlingScript()
-                injectLinkHandlingScript()
-            }
-
-            override fun shouldOverrideUrlLoading(view: WebView?, url: String?): Boolean {
-                if (url?.startsWith(baseUrl) == true) {
-                    return false
-                }
-                url?.let {
-                    val intent = Intent(Intent.ACTION_VIEW, Uri.parse(it))
-                    startActivity(intent)
-                }
-                return true
-            }
-        }
+        binding.webView.webViewClient = createWebViewClient()
 
         // Set up download listener
         binding.webView.setDownloadListener { url, userAgent, contentDisposition, mimeType, _ ->
@@ -571,76 +527,64 @@ class WebViewActivity : AppCompatActivity() {
         binding.webView.evaluateJavascript(javascript, null)
     }
 
-    private fun injectLinkHandlingScript() {
-        val javascript = """
-            (function() {
-                window.Android.log('Setting up link handling');
-                
-                // Function to handle link clicks
-                function handleLinkClick(e) {
-                    const target = e.target;
-                    let link = null;
-                    
-                    // Check if clicked element is a link or inside a link
-                    if (target.tagName === 'A') {
-                        link = target;
-                    } else if (target.closest('a')) {
-                        link = target.closest('a');
-                    }
-                    
-                    if (link && link.href) {
-                        const url = link.href;
-                        window.Android.log('Link clicked: ' + url);
-                        
-                        // Check if it's an external link (not same origin)
-                        const currentOrigin = window.location.origin;
-                        const linkUrl = new URL(url, window.location.href);
-                        
-                        if (linkUrl.origin !== currentOrigin) {
-                            e.preventDefault();
-                            e.stopPropagation();
-                            window.Android.openLink(url);
-                            return false;
-                        }
-                    }
-                    
-                    return true;
+    /**
+     * The single WebViewClient for this activity. Both the initial load and the
+     * deep-link path used to install their own byte-identical copy of this, which
+     * meant any navigation fix had to be made twice.
+     */
+    private fun createWebViewClient() = object : WebViewClient() {
+        override fun onReceivedError(
+            view: WebView?,
+            request: WebResourceRequest?,
+            error: WebResourceError?
+        ) {
+            super.onReceivedError(view, request, error)
+            // A failed subresource is not a failed page; only the main document
+            // getting no response means we cannot show anything.
+            if (request?.isForMainFrame == false) return
+            timeoutHandler.removeCallbacks(timeoutRunnable)
+            Log.e("WebViewActivity", "WebView error: ${error?.description}")
+            showConnectionError()
+        }
+
+        override fun onPageFinished(view: WebView?, url: String?) {
+            timeoutHandler.removeCallbacks(timeoutRunnable)
+            binding.progressBar.isVisible = false
+            binding.webView.alpha = 1f
+            isWebViewReady = true
+            Log.d("WebViewActivity", "WebView loaded: $url")
+            injectImageHandlingScript()
+        }
+
+        override fun shouldOverrideUrlLoading(
+            view: WebView?,
+            request: WebResourceRequest?
+        ): Boolean {
+            val url = request?.url?.toString() ?: return false
+            val decision = navigationPolicy.decide(
+                url = url,
+                isRedirect = request.isRedirect,
+                hasGesture = request.hasGesture(),
+                isMainFrame = request.isForMainFrame
+            )
+            Log.d("WebViewActivity", "Navigation $decision: $url")
+            return when (decision) {
+                NavigationPolicy.Decision.WEBVIEW -> false
+                NavigationPolicy.Decision.EXTERNAL -> {
+                    openExternally(url)
+                    true
                 }
-                
-                // Add click listener to document
-                document.addEventListener('click', handleLinkClick, true);
-                
-                // Handle dynamically added links
-                const observer = new MutationObserver(function(mutations) {
-                    mutations.forEach(function(mutation) {
-                        if (mutation.addedNodes.length) {
-                            mutation.addedNodes.forEach(function(node) {
-                                if (node.nodeType === 1) { // Element node
-                                    // Check if the added node is a link
-                                    if (node.tagName === 'A') {
-                                        node.addEventListener('click', handleLinkClick, true);
-                                    }
-                                    // Check for links inside the added node
-                                    const links = node.querySelectorAll ? node.querySelectorAll('a') : [];
-                                    for (let i = 0; i < links.length; i++) {
-                                        links[i].addEventListener('click', handleLinkClick, true);
-                                    }
-                                }
-                            });
-                        }
-                    });
-                });
-                
-                observer.observe(document.body, {
-                    childList: true,
-                    subtree: true
-                });
-                
-                window.Android.log('Link handling setup complete');
-            })();
-        """.trimIndent()
-        
-        binding.webView.evaluateJavascript(javascript, null)
+            }
+        }
+    }
+
+    private fun openExternally(url: String) {
+        try {
+            startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+        } catch (e: Exception) {
+            // No handler for mailto:/tel:/intent: etc. Staying put beats crashing.
+            Log.e("WebViewActivity", "No app to open: $url", e)
+        }
     }
 
     private fun showConnectionError() {
@@ -753,41 +697,6 @@ class WebViewActivity : AppCompatActivity() {
             // Validate and process URL parameters
             val finalUrl = processUrlParameters(processedUrl)
             Log.d("WebViewActivity", "Loading final URL: $finalUrl")
-            
-            // Set up WebViewClient with error handling
-            binding.webView.webViewClient = object : WebViewClient() {
-                override fun onReceivedError(
-                    view: WebView?,
-                    request: WebResourceRequest?,
-                    error: WebResourceError?
-                ) {
-                    super.onReceivedError(view, request, error)
-                    timeoutHandler.removeCallbacks(timeoutRunnable)
-                    Log.e("WebViewActivity", "WebView error: ${error?.description}")
-                    showConnectionError()
-                }
-
-                override fun onPageFinished(view: WebView?, url: String?) {
-                    timeoutHandler.removeCallbacks(timeoutRunnable)
-                    binding.progressBar.isVisible = false
-                    binding.webView.alpha = 1f
-                    isWebViewReady = true
-                    Log.d("WebViewActivity", "WebView loaded: $url")
-                    injectImageHandlingScript()
-                    injectLinkHandlingScript()
-                }
-
-                override fun shouldOverrideUrlLoading(view: WebView?, url: String?): Boolean {
-                    if (url?.startsWith(baseUrl) == true) {
-                        return false
-                    }
-                    url?.let {
-                        val intent = Intent(Intent.ACTION_VIEW, Uri.parse(it))
-                        startActivity(intent)
-                    }
-                    return true
-                }
-            }
             
             binding.webView.loadUrl(finalUrl)
         } catch (e: Exception) {
@@ -979,8 +888,17 @@ class WebViewActivity : AppCompatActivity() {
         intent?.let { handleIntent(it) }
     }
 
+    override fun onPause() {
+        super.onPause()
+        // WebView persists cookies lazily; without this a session cookie set
+        // during login can be lost if the process is killed while backgrounded.
+        CookieManager.getInstance().flush()
+    }
+
     override fun onDestroy() {
         timeoutHandler.removeCallbacks(timeoutRunnable)
+        pendingPermissionRequest?.deny()
+        pendingPermissionRequest = null
         binding.webView.destroy()
         super.onDestroy()
     }
