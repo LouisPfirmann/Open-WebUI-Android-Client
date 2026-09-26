@@ -10,7 +10,6 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Bundle
 import android.os.Environment
-import android.provider.MediaStore
 import android.util.Log
 import android.view.GestureDetector
 import android.view.MotionEvent
@@ -662,7 +661,7 @@ class WebViewActivity : AppCompatActivity() {
             <body>
                 <h2>Connection failed</h2>
                 <p class="url">$displayUrl</p>
-                <a class="retry" href="$baseUrl">Retry</a>
+                <a class="retry" href="$displayUrl">Retry</a>
             </body>
             </html>
         """.trimIndent()
